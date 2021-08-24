@@ -1,0 +1,49 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x86">
+      <Configuration>Debug</Configuration>
+      <Platform>x86</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{bcfdc20c-812a-4792-9f0b-e0302f63a76b}</ProjectGuid>
+    <Keyword>Linux</Keyword>
+    <RootNamespace>HttpFileServer</RootNamespace>
+    <MinimumVisualStudioVersion>15.0</MinimumVisualStudioVersion>
+    <ApplicationType>Linux</ApplicationType>
+    <ApplicationTypeRevision>1.0</ApplicationTypeRevision>
+    <TargetLinuxPlatform>Generic</TargetLinuxPlatform>
+    <LinuxProjectType>{2238F9CD-F817-4ECC-BD14-2524D2669B35}</LinuxProjectType>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x86'" Label="Configuration">
+    <UseDebugLibraries>true</UseDebugLibraries>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="Shared" />
+  <ImportGroup Label="PropertySheets" />
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x86'">
+    <IncludePath>$(INCLUDE);./include</IncludePath>
+  </PropertyGroup>
+  <ItemGroup>
+    <ClCompile Include="src\ae.c" />
+    <ClCompile Include="src\ae_epoll.c" />
+    <ClCompile Include="src\be_engine.cpp" />
+    <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\socket.cpp" />
+    <ClCompile Include="src\str.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="include\ae.h" />
+    <ClInclude Include="include\be_engine.h" />
+    <ClInclude Include="include\sdk_type.h" />
+    <ClInclude Include="include\socket.h" />
+    <ClInclude Include="include\str.h" />
+  </ItemGroup>
+  <ItemDefinitionGroup />
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>

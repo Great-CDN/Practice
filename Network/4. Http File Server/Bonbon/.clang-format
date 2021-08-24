@@ -1,0 +1,30 @@
+BasedOnStyle: Microsoft   
+IndentWidth: 4
+AccessModifierOffset: -4
+
+#AlignConsecutiveAssignments: true
+AlignConsecutiveDeclarations: true
+DerivePointerAlignment: false
+AlignConsecutiveMacros: true
+AllowShortBlocksOnASingleLine: Always
+PointerAlignment: Right
+IndentPPDirectives: AfterHash
+IndentGotoLabels: false
+IndentCaseLabels: false
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterClass: true
+  AfterFunction: true
+  AfterNamespace: true
+  AfterObjCDeclaration: true
+  AfterStruct: true
+  AfterUnion: true
+  AfterExternBlock: true
+  BeforeCatch: true
+  BeforeElse: true
+  IndentBraces: false
+  SplitEmptyFunction: false
+  SplitEmptyRecord: false
+  SplitEmptyNamespace: false
+
+

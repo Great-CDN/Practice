@@ -1,0 +1,23 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 16
+VisualStudioVersion = 16.0.31424.327
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "HttpFileServer", "HttpFileServer.vcxproj", "{BCFDC20C-812A-4792-9F0B-E0302F63A76B}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x86 = Debug|x86
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{BCFDC20C-812A-4792-9F0B-E0302F63A76B}.Debug|x86.ActiveCfg = Debug|x86
+		{BCFDC20C-812A-4792-9F0B-E0302F63A76B}.Debug|x86.Build.0 = Debug|x86
+		{BCFDC20C-812A-4792-9F0B-E0302F63A76B}.Debug|x86.Deploy.0 = Debug|x86
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {23675274-6069-4B5C-9F49-0CBF0BAF9F20}
+	EndGlobalSection
+EndGlobal
