@@ -375,6 +375,7 @@ int main(int argc, char** argv)
     server->ListenOn("0.0.0.0", 12345);
 
     engine->Start();
+    engine->Release();
     server->Release();
 
     return 0;
