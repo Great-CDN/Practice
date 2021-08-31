@@ -63,7 +63,7 @@ public:
     {}
 
     int  Initialize();
-    int  ListenOn(std::string ip, unsigned short int port);
+    int  Listen(std::string ip, unsigned short int port);
     void Release();
 
     virtual void OnRead(int fd, void* data, int mask);
