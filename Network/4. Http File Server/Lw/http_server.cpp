@@ -68,7 +68,7 @@ int TestHttpServer::Initialize()
     return res;
 }
 
-int TestHttpServer::ListenOn(std::string ip, unsigned short int port)
+int TestHttpServer::Listen(std::string ip, unsigned short int port)
 {
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
@@ -372,7 +372,7 @@ int main(int argc, char** argv)
 
     TestHttpServer* server = new TestHttpServer(engine);
     server->Initialize();
-    server->ListenOn("0.0.0.0", 12345);
+    server->Listen("0.0.0.0", 12345);
 
     engine->Start();
     engine->Release();
