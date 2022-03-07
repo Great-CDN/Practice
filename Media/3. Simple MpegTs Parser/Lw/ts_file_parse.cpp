@@ -23,10 +23,10 @@ enum StreamType
 {
     STREAM_TYPE_AUDIO_AAC = 0x0F,  // Audio, MPEG-2 AAC, AAC with adts format, common
     STREAM_TYPE_VIDEO_H264 = 0x1B, // Video, H.264 or AVC
-    STREAM_TYPE_VIDEO_HEVC = 0x24, // Video, H.265 or HEVC
+    STREAM_TYPE_VIDEO_H265 = 0x24, // Video, H.265 or HEVC
 };
 
-static const char *CODEC[] = {
+static const char* CODEC[] = {
     "unknown",
     "avc",
     "hevc",
@@ -40,18 +40,18 @@ class TsFileParser
 {
 public:
     TsFileParser(std::string file_name)
-        : m_file(file_name), m_fd(-1), m_parsed(0), m_file_size(0), m_rest(0), m_program_num(0){};
+        : m_file(file_name), m_fd(-1), m_parsed(0), m_file_size(0), m_rest_bytes(0), m_program_num(0) {};
     void Start();
-    int  ParseTsPacket(uint8_t *data, int data_len);
-    int  ParsePat(uint8_t *data, int data_len);
-    int  ParsePmt(uint8_t *data, int data_len);
+    int  ParseTsPacket(uint8_t* data, int data_len);
+    int  ParsePat(uint8_t* data, int data_len);
+    int  ParsePmt(uint8_t* data, int data_len);
     bool IsPmt(int pid);
 
 private:
     int m_fd;
-    int m_parsed;
-    int m_rest;
-    int m_file_size;
+    long long m_parsed;
+    int m_rest_bytes;
+    long long m_file_size;
     // int m_last_pes_start;
     int m_program_num;
     int m_pmt_id[16];
@@ -93,18 +93,19 @@ void TsFileParser::Start()
 
         while (m_parsed < m_file_size)
         {
-            if (m_rest)
+            if (m_rest_bytes)
             {
-                memcpy(m_buf, m_last_rest, m_rest);
+                memcpy(m_buf, m_last_rest, m_rest_bytes);
             }
 
-            int n = read(m_fd, m_buf + m_rest, BUF_SIZE - m_rest);
+            int n = read(m_fd, m_buf + m_rest_bytes, BUF_SIZE - m_rest_bytes);
             if (n <= 0)
             {
                 printf("[%s] read failed, parsed: %d\n", m_file.c_str(), m_parsed);
                 break;
             }
-            m_rest = 0;
+	    n += m_rest_bytes;
+            m_rest_bytes = 0;
 
             int parsed = 0;
             while (parsed < n)
@@ -115,10 +116,10 @@ void TsFileParser::Start()
                     continue;
                 }
 
-                if (parsed + 188 > n)
+                if (n - parsed < 188)
                 {
-                    m_rest = n - parsed;
-                    memcpy(m_last_rest, m_buf + parsed, m_rest);
+                    m_rest_bytes = n - parsed;
+                    memcpy(m_last_rest, m_buf + parsed, m_rest_bytes);
                     parsed = n;
                 }
                 else
@@ -134,7 +135,7 @@ void TsFileParser::Start()
     } while (0);
 }
 
-int TsFileParser::ParseTsPacket(uint8_t *data, int data_len)
+int TsFileParser::ParseTsPacket(uint8_t* data, int data_len)
 {
     int      offset = 4;
     uint16_t t = RB16(data + 1);
@@ -176,12 +177,12 @@ int TsFileParser::ParseTsPacket(uint8_t *data, int data_len)
             if (payload_unit_start_indicator)
             {
                 printf("[%s-%d-%d] packet pid: %d, type: pes(%s), is pes header\n", m_file.c_str(), m_parsed,
-                       m_parsed / 188, pid, CODEC[m_streams[pid]]);
+                    m_parsed / 188, pid, CODEC[m_streams[pid]]);
             }
             else
             {
                 printf("[%s-%d-%d] packet pid: %d, type: pes(%s)\n", m_file.c_str(), m_parsed, m_parsed / 188, pid,
-                       CODEC[m_streams[pid]]);
+                    CODEC[m_streams[pid]]);
             }
         }
         else
@@ -191,7 +192,7 @@ int TsFileParser::ParseTsPacket(uint8_t *data, int data_len)
     }
 }
 
-int TsFileParser::ParsePat(uint8_t *data, int data_len)
+int TsFileParser::ParsePat(uint8_t* data, int data_len)
 {
     uint16_t s = RB16(data + 2);
     uint16_t section_length = s & 0x3FF;
@@ -219,7 +220,7 @@ int TsFileParser::ParsePat(uint8_t *data, int data_len)
     }
 }
 
-int TsFileParser::ParsePmt(uint8_t *data, int data_len)
+int TsFileParser::ParsePmt(uint8_t* data, int data_len)
 {
     uint16_t s = RB16(data + 1 + 1);
     uint16_t section_length = s & 0x3FF;
@@ -247,7 +248,7 @@ int TsFileParser::ParsePmt(uint8_t *data, int data_len)
             {
                 m_streams[stream_pid] = AVC;
             }
-            else if (stream_type == STREAM_TYPE_VIDEO_HEVC)
+            else if (stream_type == STREAM_TYPE_VIDEO_H265)
             {
                 m_streams[stream_pid] = HEVC;
             }
@@ -277,12 +278,12 @@ bool TsFileParser::IsPmt(int pid)
     return re;
 }
 
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
     if (argc == 2)
     {
         std::string   file_path = argv[1];
-        TsFileParser *ts_parser = new TsFileParser(file_path);
+        TsFileParser* ts_parser = new TsFileParser(file_path);
         ts_parser->Start();
     }
     else
@@ -291,3 +292,4 @@ int main(int argc, char *argv[])
     }
     return 0;
 }
+
