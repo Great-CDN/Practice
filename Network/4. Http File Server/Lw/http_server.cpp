@@ -176,7 +176,7 @@ void TestHttpServer::OnWrite(int fd, void* data, int mask)
             char resp[1024];
             int  n = sprintf(
                 resp,
-                "HTTP/1.1 %d %s \r\nContent-Length: %d \r\nContent-Type: text/plain; charset=utf-8 \r\nConnection: close "
+                "HTTP/1.1 %d %s \r\nContent-Length: %lld \r\nContent-Type: text/plain; charset=utf-8 \r\nConnection: close "
                 "\r\n\r\n",
                 req->resp->status, status_2_str(req->resp->status).c_str(), req->resp->content_length);
 
