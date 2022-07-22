@@ -40,7 +40,7 @@ int Engine::AddIoEvent(int fd, int mask, IoHandler* handler, void* user_data)
 void Engine::DeleteIoEvent(int fd, int mask)
 {
     assert(m_fds.count(fd));
-    m_fds[fd]->mask &= !mask;
+    m_fds[fd]->mask &= ~mask;
 
     struct epoll_event ev;
     ev.data.fd = fd;
