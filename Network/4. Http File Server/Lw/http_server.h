@@ -24,10 +24,10 @@ struct HttpReqCtx
 
 struct HttpRespCtx
 {
-    int fd;
-    int sendn;
-    char rest[8 * 1024];
-    int rest_len;
+    int         fd;
+    long long   sendn;
+    char        rest[8 * 1024];
+    int         rest_len;
 
     HttpRespCtx() : fd(-1), sendn(0), rest_len(0)
     {}
@@ -37,7 +37,7 @@ struct HttpResp
 {
     int          status;
     int          header_len;
-    int          content_length;
+    long long    content_length;
     HttpRespCtx* ctx;
 
     HttpResp() : ctx(NULL)
