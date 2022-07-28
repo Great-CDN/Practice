@@ -74,14 +74,12 @@ void Engine::Start()
         for (int i = 0; i < readies; i++)
         {
             fd = evs[i].data.fd;
-            assert(m_fds.count(fd));
-
-            if (m_fds[fd]->mask & evs[i].events & EPOLLIN)
+            if (m_fds.count(fd) && m_fds[fd]->mask & evs[i].events & EPOLLIN)
             {
                 m_fds[fd]->handler->OnRead(fd, m_fds[fd]->user_data, m_fds[fd]->mask);
             }
 
-            if (m_fds[fd]->mask & evs[i].events & EPOLLOUT)
+            if (m_fds.count(fd) && m_fds[fd]->mask & evs[i].events & EPOLLOUT)
             {
                 m_fds[fd]->handler->OnWrite(fd, m_fds[fd]->user_data, m_fds[fd]->mask);
             }
