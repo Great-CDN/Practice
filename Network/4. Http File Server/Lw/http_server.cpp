@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <string.h>
+#include <sys/sendfile.h>
 
 #include "http_server.h"
 
@@ -117,8 +118,8 @@ void TestHttpServer::OnRead(int fd, void* data, int mask)
             assert(!m_reqs.count(client_fd));
             m_reqs[client_fd] = req;
 
-            printf("[fd:%d]new connection, remote: %s:%d\n", client_fd, (char*)inet_ntoa(remote.sin_addr),
-                htons(remote.sin_port));
+            //printf("[fd:%d]new connection, remote: %s:%d\n", client_fd, (char*)inet_ntoa(remote.sin_addr),
+            //    htons(remote.sin_port));
         }
         else
         {
@@ -207,68 +208,17 @@ void TestHttpServer::OnWrite(int fd, void* data, int mask)
         }
         else
         {
-            if (req->resp->ctx->rest_len)
+            off_t offset = req->resp->ctx->sendn - req->resp->header_len;
+            int sendn = sendfile(fd, req->resp->ctx->fd, &offset, 16*1024);
+            if (sendn == -1)
             {
-                int res = write(fd, req->resp->ctx->rest, req->resp->ctx->rest_len);
-                if (res == -1)
-                {
-                    if (errno != EINTR && errno != EWOULDBLOCK && errno != EAGAIN)
-                    {
-                        CloseReq(req);
-                    }
-                    break;
-                }
-
-                if (res == 0)
+                if (errno != EINTR && errno != EWOULDBLOCK && errno != EAGAIN)
                 {
                     CloseReq(req);
                     break;
                 }
-
-                assert(res <= req->resp->ctx->rest_len);
-                if (res < req->resp->ctx->rest_len)
-                {
-                    memmove(req->resp->ctx->rest, req->resp->ctx->rest + res, req->resp->ctx->rest_len - res);
-                }
-
-                req->resp->ctx->sendn += res;
-                req->resp->ctx->rest_len -= res;
             }
-            else
-            {
-                uint8_t buf[8 * 1024];
-                int     readn = read(req->resp->ctx->fd, buf, 8 * 1024);
-                if (readn == -1)
-                {
-                    CloseReq(req);
-                    break;
-                }
-
-                int res = write(fd, buf, readn);
-                if (res == -1)
-                {
-                    if (errno != EINTR && errno != EWOULDBLOCK && errno != EAGAIN)
-                    {
-                        CloseReq(req);
-                        break;
-                    }
-                }
-
-                if (res == 0)
-                {
-                    CloseReq(req);
-                    break;
-                }
-
-                assert(res <= readn);
-                if (res < readn)
-                {
-                    memcpy(req->resp->ctx->rest, buf + res, readn - res);
-                    req->resp->ctx->rest_len = readn - res;
-                }
-
-                req->resp->ctx->sendn += res;
-            }
+            req->resp->ctx->sendn += sendn;
         }
 
         if (req->resp->status != 200 || req->resp->header_len + req->resp->content_length == req->resp->ctx->sendn)
