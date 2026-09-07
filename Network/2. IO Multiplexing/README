@@ -1,0 +1,27 @@
+# Linux I/O Multiplexing
+
+本章用两个单线程 TCP 回射服务端演示 Linux I/O 多路复用：
+
+- `qml/select/my_echo.cpp`：`select` 水平触发模型。
+- `qml/epoll/echo_epoll.cpp`：Linux `epoll` 水平触发模型。
+- 两个目录中的 `client.cpp`：功能一致的测试客户端，支持普通发送和 `--split` 分段发送。
+
+## 编译与运行
+
+在 Linux 终端进入任一实现目录：
+
+```sh
+make
+./my_echo                 # select 目录
+./echo_epoll              # epoll 目录
+```
+
+另开终端启动客户端：
+
+```sh
+./client                  # 连接 127.0.0.1:9877
+./client 192.0.2.10       # 连接指定 IPv4 地址
+./client --split          # 每 3 字节分段发送
+```
+
+输入 `exit` 结束客户端。两个服务端使用相同端口，不能同时启动。

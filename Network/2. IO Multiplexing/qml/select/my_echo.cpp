@@ -1,221 +1,264 @@
-﻿#include <cstdio>     
-#include <cstdlib>    
-#include <cstdarg>    
-#include <cstring>    
-#include <ctime>     
-#include <string>     
-#include <vector>     
-#include <map>        
-#define WIN32_LEAN_AND_MEAN   
-#include <winsock2.h>         
-#include <ws2tcpip.h>         
-#pragma comment(lib, "ws2_32.lib")   
+// Linux TCP 回射服务端（select 版）：使用一个线程同时服务多个客户端。
+// 所有 socket 都是非阻塞的；select 负责等待连接、读和写事件。
+// 主循环：重建 fd 集合 -> select -> accept/recv/send -> 下一轮。
+#include <cerrno>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include <arpa/inet.h>   // inet_ntop
+#include <fcntl.h>      // fcntl、O_NONBLOCK
+#include <netinet/in.h> // sockaddr_in、htons、htonl、ntohs
+#include <sys/select.h> // select、fd_set、FD_* 宏
+#include <sys/socket.h> // socket、bind、listen、accept、recv、send
+#include <unistd.h>     // close
 
-enum {
-    SERV_PORT = 9877,   // 服务器监听端口（UNP 惯例端口）
-    LISTENQ   = 16,     // listen backlog：内核中已完成握手等待 accept 的连接队列长度
-    MAXLINE   = 4096    // 单次 recv 的最大字节数
-};
+enum { SERV_PORT = 9877, LISTENQ = 16, MAXLINE = 4096 };
 
-
-typedef int socklen_t;
-
-
-// 每个客户端连接对应一个 Conn，记录该连接的全部上下文
+// 一个 Conn 保存一条客户端连接跨越多轮 select 所需的状态。
 struct Conn {
-    long          id;      // 连接编号：全局从 1 递增，日志里用来区分不同客户端
-    std::string   peer;    // 对端地址 "ip:port"，日志展示用
-    unsigned long msgs;    // 本连接第几条数据：从 1 递增，区分同一连接的不同请求
-    std::string   out;     // 待发送缓冲：send 没发完（内核缓冲满）的字节暂存在这里，
-                           // 等 select 报告"可写"后再继续发 —— 这就是对分段发送的支持
+    long id;               // 日志中的连接编号
+    std::string peer;      // 对端地址，格式为 "ip:port"
+    unsigned long reads;   // 本连接成功 recv 的次数
+    std::string out;       // 尚未发送完的回射数据
+    bool read_closed;      // 对端是否已关闭发送方向
 };
 
-static std::map<SOCKET, Conn> g_conns;   // 全局连接表：fd -> 连接状态
-static long g_next_id = 1;               // 下一个新连接分配到的编号
+static std::map<int, Conn> g_conns; // Linux 文件描述符 -> 连接状态
+static long g_next_id = 1;
 
-
-
-
-static void logmsg(const Conn* c, const char* fmt, ...) {
-    char ts[32], msg[1024];
-
-    time_t now = time(NULL);                    // 当前日历时间（秒）
-    struct tm tm_buf;                           // MSVC 安全版 localtime：结果写入调用者的缓冲，
-    localtime_s(&tm_buf, &now);                 // 注意参数顺序与标准 localtime 相反（缓冲在前）
-    strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", &tm_buf);   // 格式化成 "2026-08-28 11:41:07"
-
-    va_list ap;                     // 可变参数：把 fmt 后的参数格式化进 msg
-    va_start(ap, fmt);
-    vsnprintf(msg, sizeof msg, fmt, ap);
-    va_end(ap);
-
-    if (c)
-        printf("[%s] [conn %ld] [%s] %s\n", ts, c->id, c->peer.c_str(), msg);
-    else
-        printf("[%s] [server] [-] %s\n", ts, msg);
-    fflush(stdout);                 // 立即刷出，日志实时可见（配合下面的无缓冲设置双保险）
-}
-
-
-static void die(const char* what) {
-    fprintf(stderr, "[FATAL] %s failed, WSA error %d\n", what, WSAGetLastError());
+static void err(const char* message) {
+    perror(message);
     exit(EXIT_FAILURE);
 }
 
-// 把 socket 设为非阻塞模式：之后 recv/send/accept 不会卡住，
+// 输出统一格式的日志；conn == nullptr 表示服务器自身的事件。
+static void logmsg(const Conn* conn, const char* format, ...) {
+    char timestamp[32] = "unknown-time";
+    const time_t now = time(nullptr);
+    tm local{};
+    if (localtime_r(&now, &local) != nullptr) {
+        strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &local);
+    }
 
-static void set_nonblock(SOCKET fd) {
-    u_long mode = 1;                       // 1 = 非阻塞，0 = 阻塞
-    if (ioctlsocket(fd, FIONBIO, &mode) != 0) die("ioctlsocket");
+    char message[1024];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+
+    if (conn != nullptr) {
+        printf("[%s] [conn %ld] [%s] %s\n", timestamp, conn->id, conn->peer.c_str(), message);
+    } else {
+        printf("[%s] [server] [-] %s\n", timestamp, message);
+    }
 }
 
-// 尽力把 out 缓冲里的数据全部发出去
-// 返回值： 1 = 已清空；0 = 内核发送缓冲满（WSAEWOULDBLOCK），剩余字节留在 out 里等下轮；
-//         -1 = 连接出错（对端 reset 等），调用方应关闭该连接
-static int flush_out(SOCKET fd, Conn& c) {
-    while (!c.out.empty()) {
-        // 尝试把 out 里全部字节一次性发出
-        int n = send(fd, c.out.data(), (int)c.out.size(), 0);
-        if (n > 0) {
-            // 发出了 n 字节：记日志，从缓冲头部删掉已发出的部分，继续尝试发剩余的
-            logmsg(&c, "send  %d bytes (%d bytes pending)", n, (int)c.out.size() - n);
-            c.out.erase(0, (size_t)n);
+// 非阻塞 socket 在暂时不能继续 accept/recv/send 时返回 -1，并把 errno
+// 设为 EAGAIN 或 EWOULDBLOCK，使事件循环可以继续服务其他连接。
+static bool SetNonblocking(int fd) {
+    const int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        perror("fcntl");
+        return false;
+    }
+    return true;
+}
+
+static std::string PeerName(const sockaddr_in& address) {
+    char ip[INET_ADDRSTRLEN] = "unknown";
+    if (inet_ntop(AF_INET, &address.sin_addr, ip, sizeof(ip)) == nullptr) {
+        perror("inet_ntop");
+    }
+
+    char peer[64];
+    snprintf(peer, sizeof(peer), "%s:%u", ip, static_cast<unsigned int>(ntohs(address.sin_port)));
+    return peer;
+}
+
+// 尽可能发送 out 中的所有数据。
+// 返回 true 表示连接仍可用；若内核发送缓冲区已满，未发送部分保留到下一轮。
+static bool FlushOutput(int fd, Conn& conn) {
+    while (!conn.out.empty()) {
+        // MSG_NOSIGNAL 防止对端断开时 SIGPIPE 直接终止整个服务端。
+        const ssize_t written = send(fd, conn.out.data(), conn.out.size(), MSG_NOSIGNAL);
+        if (written > 0) {
+            conn.out.erase(0, static_cast<size_t>(written));
+            logmsg(&conn, "send %zd bytes (%zu bytes pending)", written, conn.out.size());
             continue;
         }
-        // n < 0（理论上 send 不返回 0）：查看具体错误
-        int e = WSAGetLastError();
-        if (e == WSAEWOULDBLOCK || e == WSAEINPROGRESS)
-            return 0;              // 内核缓冲满，正常现象：留着慢慢发
-        return -1;                 // 真正的错误
+        if (written == -1 && errno == EINTR) continue;
+        if (written == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) return true;
+
+        if (written == 0) {
+            fprintf(stderr, "send: 未能继续发送数据\n");
+        } else {
+            perror("send");
+        }
+        return false;
     }
-    return 1;                      // 循环正常结束 = 全部发完
+    return true;
 }
 
-// 关闭一条连接：打日志 -> 关 socket -> 从连接表删除
-static void close_conn(SOCKET fd, const char* reason) {
-    auto it = g_conns.find(fd);
-    if (it == g_conns.end()) return;             // 已被删过，防止重复关闭
-    logmsg(&it->second, "closed (%s)", reason);  // 记录关闭原因（EOF/错误）
-    closesocket(fd);                             
+static void CloseConnection(int fd, const char* reason) {
+    const auto it = g_conns.find(fd);
+    if (it == g_conns.end()) return;
+
+    logmsg(&it->second, "closed (%s)", reason);
+    close(fd);
     g_conns.erase(it);
 }
 
-int main() {
-    setvbuf(stdout, NULL, _IONBF, 0);   // 关闭 stdout 缓冲：printf 直接输出，日志实时可见
-
-    //1. 初始化 Winsock
-    // Windows 特有：进程第一次使用 socket 前必须先启动 Winsock 库（加载 ws2_32.dll）
-    WSADATA wsa;                                  // 接收库初始化信息的结构体
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)    
-        die("WSAStartup");                        
-
-    //2. 创建监听 socket
-    // AF_INET = IPv4 协议族，SOCK_STREAM = 字节流套接字，第三个参数 0 = 默认协议（即 TCP）
-    SOCKET listenfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listenfd == INVALID_SOCKET) die("socket");
-
-    // 设置 SO_REUSEADDR：服务器重启时端口若处于 TIME_WAIT 状态也能立刻重新绑定，
-    // 否则要等几分钟才能再次 bind 同一端口
-    BOOL on = TRUE;
-    setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, (const char*)&on, sizeof on);
-
-    //3. 绑定地址和端口
-    sockaddr_in servaddr{};                       // IPv4 地址结构，{} 零初始化
-    servaddr.sin_family      = AF_INET;           // 协议族：IPv4
-    servaddr.sin_addr.s_addr = htonl(INADDR_ANY); // 监听本机所有网卡；htonl：主机序 -> 网络序
-    servaddr.sin_port        = htons(SERV_PORT);  // 端口 9877；htons：主机序 -> 网络序
-    if (bind(listenfd, (sockaddr*)&servaddr, sizeof servaddr) == SOCKET_ERROR) die("bind");
-
-    //4. 进入监听状态
-    // LISTENQ 是 backlog：已完成三次握手、等待 accept 的连接排队上限
-    if (listen(listenfd, LISTENQ) == SOCKET_ERROR) die("listen");
-    set_nonblock(listenfd);    // 监听 socket 也设非阻塞：accept 取完队列里的连接立即返回
-    logmsg(NULL, "listening on 0.0.0.0:%d (select model, FD_SETSIZE=%d)", SERV_PORT, FD_SETSIZE);
-
-    //5. 事件循环
-    //每轮：收集所有关心的 fd -> select 阻塞等待 -> 逐个处理就绪的 fd
+// 监听 socket 可读时，循环 accept，直到已完成握手的连接队列被取空。
+static void AcceptConnections(int listenfd) {
     for (;;) {
-        fd_set rs, ws;            // rs = 关心"可读"的集合，ws = 关心"可写"的集合
-        FD_ZERO(&rs);             // 清空可读集合
-        FD_ZERO(&ws);             // 清空可写集合
-        FD_SET(listenfd, &rs);    // 监听 socket"可读" = 有新连接到来
-        for (auto& kv : g_conns) {
-            FD_SET(kv.first, &rs);            // 每个连接都关心"可读"（对方发数据来/关连接）
-            if (!kv.second.out.empty())       // 只有 out 缓冲还有存货，才需要关心"可写"
-                FD_SET(kv.first, &ws);        // （缓冲空时订阅可写会永远立即触发，空转 CPU）
+        sockaddr_in client_address{};
+        socklen_t address_length = sizeof(client_address);
+        const int fd = accept(listenfd, reinterpret_cast<sockaddr*>(&client_address), &address_length);
+        if (fd == -1) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            perror("accept");
+            return; // 单次 accept 失败不应终止已有连接
         }
 
-        // select 阻塞直到任一 fd 就绪；返回值 = 就绪 fd 的总个数
-       
-        // 最后一个 NULL = 不设超时，永久等待
-        int ready = select(0, &rs, &ws, NULL, NULL);
-        if (ready == SOCKET_ERROR) die("select");
-
-        //监听 socket 可读 
-        if (FD_ISSET(listenfd, &rs)) {
-            for (;;) {   // 循环 accept 把队列取空（一次 select 可能来了多个连接）
-                sockaddr_in cliaddr{};                    // 出参：接收对方的 IP 和端口
-                socklen_t clilen = sizeof cliaddr;        // 必须先初始化为结构体大小
-                SOCKET fd = accept(listenfd, (sockaddr*)&cliaddr, &clilen);
-                if (fd == INVALID_SOCKET) break;          // 非阻塞：队列取空即返回 WSAEWOULDBLOCK
-                set_nonblock(fd);                         // 新连接也设非阻塞
-
-                // 把对方地址转成可读字符串 "ip:port"
-                char ip[INET_ADDRSTRLEN];                
-                inet_ntop(AF_INET, &cliaddr.sin_addr, ip, sizeof ip);
-                char peer[64];
-                snprintf(peer, sizeof peer, "%s:%u", ip, (unsigned)ntohs(cliaddr.sin_port));
-
-                // 登记到连接表，分配连接编号
-                Conn c;
-                c.id   = g_next_id++;   // 编号从 1 递增：日志里区分不同客户端
-                c.msgs = 0;             // 请求计数清零
-                c.peer = peer;
-                g_conns[fd] = c;
-                logmsg(&g_conns[fd], "connected");
-            }
+        // select 的 fd_set 只能表示 [0, FD_SETSIZE) 内的描述符。
+        if (fd >= FD_SETSIZE) {
+            fprintf(stderr, "[reject] fd %d exceeds FD_SETSIZE=%d\n", fd, FD_SETSIZE);
+            close(fd);
+            continue;
+        }
+        if (!SetNonblocking(fd)) {
+            close(fd);
+            continue;
         }
 
-        //谁就绪服务谁
-        // 先对连接表的 key 做一份快照：下面处理过程中可能 close 并修改 map，
-        
-        std::vector<SOCKET> fds;
+        Conn conn{};
+        conn.id = g_next_id++;
+        conn.peer = PeerName(client_address);
+        conn.reads = 0;
+        conn.read_closed = false;
+        const auto inserted = g_conns.emplace(fd, std::move(conn));
+        logmsg(&inserted.first->second, "connected");
+    }
+}
+
+// 非阻塞 recv 要一直读到 EAGAIN，确保一次可读通知中的数据被取完。
+// 返回 false 表示连接发生了不可恢复的读取错误。
+static bool ReadAvailable(int fd, Conn& conn) {
+    char buffer[MAXLINE];
+    for (;;) {
+        const ssize_t received = recv(fd, buffer, sizeof(buffer), 0);
+        if (received > 0) {
+            ++conn.reads;
+            conn.out.append(buffer, static_cast<size_t>(received));
+            logmsg(&conn, "recv #%lu %zd bytes: \"%.*s\"", conn.reads, received,
+                   static_cast<int>(received), buffer);
+            continue;
+        }
+        if (received == 0) {
+            // 保留已经收到的待发送数据；全部回射后再关闭连接。
+            conn.read_closed = true;
+            return true;
+        }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
+
+        perror("recv");
+        return false;
+    }
+}
+
+int main() {
+    // 关闭 stdout 缓冲，让 Linux 控制台立即显示事件循环日志。
+    setvbuf(stdout, nullptr, _IONBF, 0);
+
+    // 1. 创建并配置非阻塞 IPv4 TCP 监听 socket。
+    const int listenfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listenfd == -1) err("socket");
+    if (listenfd >= FD_SETSIZE) {
+        fprintf(stderr, "listen fd %d exceeds FD_SETSIZE=%d\n", listenfd, FD_SETSIZE);
+        close(listenfd);
+        return EXIT_FAILURE;
+    }
+
+    const int reuse = 1;
+    if (setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == -1) {
+        err("setsockopt");
+    }
+
+    sockaddr_in server_address{};
+    server_address.sin_family = AF_INET;
+    server_address.sin_addr.s_addr = htonl(INADDR_ANY);
+    server_address.sin_port = htons(SERV_PORT);
+    if (bind(listenfd, reinterpret_cast<const sockaddr*>(&server_address), sizeof(server_address)) == -1) {
+        err("bind");
+    }
+    if (listen(listenfd, LISTENQ) == -1) err("listen");
+    if (!SetNonblocking(listenfd)) {
+        close(listenfd);
+        return EXIT_FAILURE;
+    }
+
+    logmsg(nullptr, "listening on 0.0.0.0:%d (select, FD_SETSIZE=%d)", SERV_PORT, FD_SETSIZE);
+
+    // 2. 事件循环。select 会修改传入的集合，所以每轮都必须重新构造。
+    for (;;) {
+        fd_set readfds;
+        fd_set writefds;
+        FD_ZERO(&readfds);
+        FD_ZERO(&writefds);
+        FD_SET(listenfd, &readfds);
+        int maxfd = listenfd;
+
+        // 快照既用于构造集合，也避免处理事件时删除 map 元素导致迭代器失效。
+        std::vector<int> fds;
         fds.reserve(g_conns.size());
-        for (auto& kv : g_conns) fds.push_back(kv.first);
+        for (const auto& item : g_conns) {
+            const int fd = item.first;
+            const Conn& conn = item.second;
+            fds.push_back(fd);
+            if (!conn.read_closed) FD_SET(fd, &readfds);
+            if (!conn.out.empty()) FD_SET(fd, &writefds);
+            if (fd > maxfd) maxfd = fd;
+        }
 
-        for (SOCKET fd : fds) {
+        // Linux 要求第一个参数是“最大描述符 + 1”，否则内核不会检查这些描述符。
+        const int ready = select(maxfd + 1, &readfds, &writefds, nullptr, nullptr);
+        if (ready == -1) {
+            if (errno == EINTR) continue;
+            err("select");
+        }
+
+        if (FD_ISSET(listenfd, &readfds)) AcceptConnections(listenfd);
+
+        // 3. 只处理本轮 select 前已经登记的客户端。
+        for (const int fd : fds) {
             auto it = g_conns.find(fd);
-            if (it == g_conns.end()) continue;   // 该连接可能已被前面的分支关闭，跳过
-            Conn& c = it->second;
+            if (it == g_conns.end()) continue;
 
-            // (a) 可读事件：对方发来数据，或对方关闭了连接
-            if (FD_ISSET(fd, &rs)) {
-                char buf[MAXLINE];
-                int n = recv(fd, buf, sizeof buf, 0);   // 非阻塞：立即返回
-                if (n == 0) {                           // 返回 0 = 对端正常关闭（发了 FIN）
-                    close_conn(fd, "EOF by peer");
-                    continue;
-                }
-                if (n < 0) {                            // 返回 -1 = 出错或暂时无数据
-                    int e = WSAGetLastError();
-                    if (e == WSAEWOULDBLOCK || e == WSAEINPROGRESS)
-                        continue;                       // 暂时无数据，正常，下一轮再说
-                    close_conn(fd, "recv error");       // 其他错误：连接已坏，关闭
-                    continue;
-                }
-                // n > 0：收到 n 字节。
-                // 注意：TCP 是字节流没有消息边界，这里读到的可能只是半截消息，
-                // 回射服务器无需关心边界，读到什么就原样回什么
-                logmsg(&c, "recv  #%lu %d bytes: \"%.*s\"", ++c.msgs, n, n, buf);
-                c.out.append(buf, (size_t)n);           // 先追加到待发送缓冲，下面统一发
+            const bool readable = FD_ISSET(fd, &readfds);
+            const bool writable = FD_ISSET(fd, &writefds);
+            if (readable && !ReadAvailable(fd, it->second)) {
+                CloseConnection(fd, "recv error");
+                continue;
             }
 
-            // (b) 发送：刚收到数据，或 select 报告"可写"（内核缓冲有空位），都尝试发
-            if (!c.out.empty() && flush_out(fd, c) < 0) {
-                close_conn(fd, "send error");           // 发送出错：关闭该连接
+            // 刚读到的数据可以立即尝试发送；不必等下一轮 select 报告可写。
+            if (!it->second.out.empty() && (readable || writable) && !FlushOutput(fd, it->second)) {
+                CloseConnection(fd, "send error");
+                continue;
+            }
+
+            // TCP 半关闭后，先回射最后收到的数据，再释放连接。
+            if (it->second.read_closed && it->second.out.empty()) {
+                CloseConnection(fd, "EOF by peer");
             }
         }
-       
     }
 }

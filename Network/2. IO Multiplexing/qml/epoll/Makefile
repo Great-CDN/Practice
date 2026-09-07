@@ -6,16 +6,15 @@
 #   make clean      清理所有产物
 
 CXX      := g++
-CXXFLAGS := -Wall -Wextra -O2 -std=c++11
+CXXFLAGS := -Wall -Wextra -Wpedantic -O2 -std=c++11
 
 BINS := echo_epoll client
 
-.PHONY: all server client clean
+.PHONY: all server clean
 
 all: $(BINS)
 
 server: echo_epoll
-client: client
 
 echo_epoll: echo_epoll.cpp
 	$(CXX) $(CXXFLAGS) $< -o $@
