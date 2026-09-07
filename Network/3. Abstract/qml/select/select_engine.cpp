@@ -1,86 +1,101 @@
-﻿#include "select_engine.h"
+#include "select_engine.h"
+
 #include <cerrno>
-#include <cstddef>
+#include <cstdio>
+#include <vector>
 
 SelectEngine::SelectEngine() : maxfd_(-1), running_(true) {
-    FD_ZERO(&master_r_);
-    FD_ZERO(&master_w_);
+    FD_ZERO(&readfds_);
+    FD_ZERO(&writefds_);
 }
 
-SelectEngine::~SelectEngine() {}
+SelectEngine::~SelectEngine() = default;
 
-ErrCode SelectEngine::AddIoEvent(FD fd, int32_t mask, IIoHandler* handler, void* user_data) {
-    // 参数合法性：fd 越界（select 硬限制 FD_SETSIZE）、空回调、非法 mask 位都拒绝
-    if (fd < 0 || fd >= FD_SETSIZE || handler == NULL ||
-        (mask & ~(kReadEvent | kWriteEvent)) != 0)
+ErrCode SelectEngine::AddIoEvent(FD fd, std::int32_t events, IIoHandler* handler,
+                                 void* user_data) {
+    constexpr std::int32_t kAllEvents = kReadEvent | kWriteEvent;
+    if (fd < 0 || fd >= FD_SETSIZE || handler == nullptr || events == 0 ||
+        (events & ~kAllEvents) != 0) {
         return kErr;
+    }
 
-    Entry& e = entries_[fd];          // 不存在则新建，存在则复用
-    e.handler   = handler;
-    e.user_data = user_data;
-    e.mask     |= mask;               // 叠加语义：mask 取并集
-    if (e.mask & kReadEvent)  FD_SET(fd, &master_r_);
-    if (e.mask & kWriteEvent) FD_SET(fd, &master_w_);
+    auto it = entries_.find(fd);
+    if (it == entries_.end()) {
+        // 显式初始化 events，避免读取未初始化的掩码。
+        const Entry entry{handler, user_data, events};
+        it = entries_.emplace(fd, entry).first;
+    } else {
+        it->second.handler = handler;
+        it->second.user_data = user_data;
+        it->second.events |= events;
+    }
+
+    if ((it->second.events & kReadEvent) != 0) FD_SET(fd, &readfds_);
+    if ((it->second.events & kWriteEvent) != 0) FD_SET(fd, &writefds_);
     if (fd > maxfd_) maxfd_ = fd;
     return kOk;
 }
 
-void SelectEngine::DeleteIoEvent(FD fd, int32_t mask) {
-    auto it = entries_.find(fd);
+void SelectEngine::DeleteIoEvent(FD fd, std::int32_t events) {
+    const auto it = entries_.find(fd);
     if (it == entries_.end()) return;
 
-    Entry& e = it->second;
-    e.mask &= ~mask;                  // 只清掉指定的事件位
-    if (!(e.mask & kReadEvent))  FD_CLR(fd, &master_r_);
-    if (!(e.mask & kWriteEvent)) FD_CLR(fd, &master_w_);
+    constexpr std::int32_t kAllEvents = kReadEvent | kWriteEvent;
+    it->second.events &= ~(events & kAllEvents);
+    if ((it->second.events & kReadEvent) == 0) FD_CLR(fd, &readfds_);
+    if ((it->second.events & kWriteEvent) == 0) FD_CLR(fd, &writefds_);
 
-    if (e.mask == 0) {                // 读写都不关注了：彻底移出引擎
+    if (it->second.events == 0) {
         entries_.erase(it);
         if (fd == maxfd_) UpdateMaxFd();
     }
 }
 
 void SelectEngine::UpdateMaxFd() {
-    maxfd_ = -1;
-    for (auto& kv : entries_)
-        if (kv.first > maxfd_) maxfd_ = kv.first;
+    maxfd_ = entries_.empty() ? -1 : entries_.rbegin()->first;
 }
 
 ErrCode SelectEngine::Run() {
+    running_ = true;
     while (running_) {
-        // 关键：select 会改写传入的集合，每轮必须从主集合拷贝工作副本
-        fd_set rs = master_r_;
-        fd_set ws = master_w_;
+        if (entries_.empty()) return kOk;
 
-        int n = select(maxfd_ + 1, &rs, &ws, NULL, NULL);
-        if (n < 0) {
-            if (errno == EINTR) continue;   // 被信号打断，重来
+        // select 会覆盖传入集合，只能把主集合复制给本轮系统调用。
+        fd_set readable = readfds_;
+        fd_set writable = writefds_;
+        const int ready = select(maxfd_ + 1, &readable, &writable, nullptr, nullptr);
+        if (ready == -1) {
+            if (errno == EINTR) continue;
+            perror("select");
             return kErr;
         }
 
-        // select 的固有代价：只知道"n 个就绪"，不知道是谁，
-        // 必须扫描 0..maxfd 逐个 FD_ISSET —— O(n)
-        for (FD fd = 0; fd <= maxfd_ && n > 0; ++fd) {
-            int32_t fired = 0;
-            if (FD_ISSET(fd, &rs)) fired |= kReadEvent;
-            if (FD_ISSET(fd, &ws)) fired |= kWriteEvent;
+        // 回调可以删除 fd，所以先保存本轮注册项的描述符快照。
+        std::vector<FD> fds;
+        fds.reserve(entries_.size());
+        for (const auto& item : entries_) fds.push_back(item.first);
+
+        // select 不会给出就绪列表，仍需逐项执行 FD_ISSET。
+        for (const FD fd : fds) {
+            std::int32_t fired = 0;
+            if (FD_ISSET(fd, &readable)) fired |= kReadEvent;
+            if (FD_ISSET(fd, &writable)) fired |= kWriteEvent;
             if (fired == 0) continue;
-            --n;
 
             auto it = entries_.find(fd);
             if (it == entries_.end()) continue;
-            IIoHandler* handler   = it->second.handler;
-            void*       user_data = it->second.user_data;
 
-            // 注意：OnRead 回调里可能关闭连接（DeleteIoEvent + delete this），
-            // 所以调 OnWrite 前必须重新确认 entry 还在，否则悬空指针
-            if (fired & kReadEvent)
-                handler->OnRead(fd, user_data, fired);
+            // OnRead 可能关闭连接并销毁处理器。调用 OnWrite 前必须重新查表。
+            if ((fired & kReadEvent) != 0) {
+                IIoHandler* const handler = it->second.handler;
+                handler->OnRead(fd, it->second.user_data, fired);
+            }
 
             it = entries_.find(fd);
             if (it == entries_.end()) continue;
-            if (fired & kWriteEvent)
+            if ((fired & kWriteEvent) != 0 && (it->second.events & kWriteEvent) != 0) {
                 it->second.handler->OnWrite(fd, it->second.user_data, fired);
+            }
         }
     }
     return kOk;

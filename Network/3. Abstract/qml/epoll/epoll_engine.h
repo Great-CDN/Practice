@@ -1,35 +1,33 @@
-﻿#pragma once
-#include "event_engine.h"
-#include <sys/epoll.h>
+#pragma once
+
+#include "../event_engine.h"
+
 #include <map>
 
-class EpollEngine : public IEventEngine
-{
+// 使用 Linux epoll 水平触发模式实现公共事件引擎接口。
+class EpollEngine : public IEventEngine {
 public:
     EpollEngine();
     ~EpollEngine() override;
 
-    ErrCode AddIoEvent(FD fd, int32_t mask, IIoHandler* handler, void* user_data) override;
-    void    DeleteIoEvent(FD fd, int32_t mask) override;
-
-    // 事件主循环：epoll_wait 等待 -> 分发回调
-    ErrCode Run();
-
-    void Stop() { running_ = false; }
+    ErrCode AddIoEvent(FD fd, std::int32_t events, IIoHandler* handler,
+                       void* user_data) override;
+    void DeleteIoEvent(FD fd, std::int32_t events) override;
+    ErrCode Run() override;
+    void Stop() override { running_ = false; }
 
 private:
     struct Entry {
         IIoHandler* handler;
-        void*       user_data;
-        int32_t     mask;    // 当前关注的事件（读/写可独立增删）
+        void* user_data;
+        std::int32_t events;
     };
 
-    // 把 entries_[fd] 里的 mask 同步到内核：新 fd 用 ADD，老 fd 用 MOD
-    ErrCode SyncToKernel(FD fd, int32_t mask, bool exists);
+    ErrCode UpdateKernel(FD fd, std::int32_t events, int operation);
 
-    int                epfd_;      // epoll 实例（内核事件表）的句柄
-    std::map<FD, Entry> entries_;  // fd -> 注册信息
-    bool               running_;
+    static constexpr int kMaxEvents = 64;
 
-    static const int kMaxEvents = 64;   // epoll_wait 单次最多取回的就绪事件数
+    int epfd_;                    // epoll 实例本身也是 Linux 文件描述符
+    std::map<FD, Entry> entries_; // fd -> 回调和当前关注项
+    bool running_;
 };

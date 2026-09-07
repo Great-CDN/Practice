@@ -1,34 +1,34 @@
-﻿
 #pragma once
-#include "event_engine.h"
-#include <sys/select.h>
-#include <map>
 
-class SelectEngine : public IEventEngine
-{
+#include "../event_engine.h"
+
+#include <map>
+#include <sys/select.h>
+
+// 使用 Linux select 实现公共事件引擎接口。
+class SelectEngine : public IEventEngine {
 public:
     SelectEngine();
     ~SelectEngine() override;
 
-    ErrCode AddIoEvent(FD fd, int32_t mask, IIoHandler* handler, void* user_data) override;
-    void    DeleteIoEvent(FD fd, int32_t mask) override;
-
-    // 事件主循环：select 等待 -> 分发回调，业务方调一次即可
-    ErrCode Run();
-
-    void Stop() { running_ = false; }   // 需要退出循环时调用
+    ErrCode AddIoEvent(FD fd, std::int32_t events, IIoHandler* handler,
+                       void* user_data) override;
+    void DeleteIoEvent(FD fd, std::int32_t events) override;
+    ErrCode Run() override;
+    void Stop() override { running_ = false; }
 
 private:
     struct Entry {
         IIoHandler* handler;
-        void*       user_data;
-        int32_t     mask;    // 当前关注的事件（读/写可独立增删）
+        void* user_data;
+        std::int32_t events;
     };
+
     void UpdateMaxFd();
 
-    std::map<FD, Entry> entries_;   // fd -> 注册信息
-    fd_set  master_r_;              // 主可读集合（select 会改写传入集合，每轮需拷贝）
-    fd_set  master_w_;              // 主可写集合
-    FD      maxfd_;
-    bool    running_;
+    std::map<FD, Entry> entries_; // fd -> 回调和当前关注项
+    fd_set readfds_;              // select 会修改工作副本，因此保留主集合
+    fd_set writefds_;
+    FD maxfd_;
+    bool running_;
 };

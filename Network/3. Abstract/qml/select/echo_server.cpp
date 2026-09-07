@@ -1,86 +1,138 @@
-﻿#include "select_engine.h"
-#include <cstdio>
-#include <cstdarg>
-#include <cstring>
+// Linux TCP 回射服务端：业务层只依赖 IEventEngine，不直接调用 select。
+#include "select_engine.h"
+
 #include <cerrno>
-#include <csignal>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <string>
 
-#include <sys/socket.h>
-#include <netinet/in.h>
 #include <arpa/inet.h>
-#include <unistd.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 enum { SERV_PORT = 9877, LISTENQ = 16, MAXLINE = 4096 };
 
-// 标准化日志：[时间] [conn 编号] [对端地址] 内容
-static void LogLine(long id, const char* peer, const char* fmt, ...) {
-    char ts[32], msg[1024];
-    time_t now = time(NULL);
-    strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", localtime(&now));
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(msg, sizeof msg, fmt, ap);
-    va_end(ap);
-    printf("[%s] [conn %ld] [%s] %s\n", ts, id, peer, msg);
-    fflush(stdout);
-}
+// id 为 0 表示服务器日志，否则输出连接编号和对端地址。
+static void LogLine(long id, const char* peer, const char* format, ...) {
+    char timestamp[32] = "unknown-time";
+    const time_t now = time(nullptr);
+    tm local{};
+    if (localtime_r(&now, &local) != nullptr) {
+        strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &local);
+    }
 
-static void set_nonblock(int fd) {
-    int fl = fcntl(fd, F_GETFL, 0);
-    if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) {
-        fprintf(stderr, "[FATAL] fcntl failed: %s\n", strerror(errno));
-        exit(EXIT_FAILURE);
+    char message[1024];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+
+    if (id == 0) {
+        printf("[%s] [server] [-] %s\n", timestamp, message);
+    } else {
+        printf("[%s] [conn %ld] [%s] %s\n", timestamp, id, peer, message);
     }
 }
 
+static bool SetNonblocking(int fd) {
+    const int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        perror("fcntl");
+        return false;
+    }
+    return true;
+}
+
+static std::string PeerName(const sockaddr_in& address) {
+    char ip[INET_ADDRSTRLEN] = "unknown";
+    if (inet_ntop(AF_INET, &address.sin_addr, ip, sizeof(ip)) == nullptr) {
+        perror("inet_ntop");
+    }
+
+    char peer[64];
+    snprintf(peer, sizeof(peer), "%s:%u", ip,
+             static_cast<unsigned int>(ntohs(address.sin_port)));
+    return peer;
+}
+
+// 每条连接拥有一个 EchoSession。它只通过公共接口增删读写关注项。
 class EchoSession : public IIoHandler {
 public:
-    EchoSession(SelectEngine& engine, FD fd, long id, const std::string& peer)
-        : engine_(engine), fd_(fd), id_(id), peer_(peer) {
+    EchoSession(IEventEngine& engine, FD fd, long id, const std::string& peer)
+        : engine_(engine), fd_(fd), id_(id), peer_(peer), reads_(0),
+          read_closed_(false) {}
+
+    void LogConnected() const {
         LogLine(id_, peer_.c_str(), "connected");
     }
 
-    // 可读：对端发来数据（n>0）或关闭连接（n=0）
-    void OnRead(FD fd, void* data, int32_t mask) override {
-        (void)data; (void)mask;   // 本例用不上，引擎保证 OnRead 只在可读时被调
-        char buf[MAXLINE];
-        ssize_t n = recv(fd_, buf, sizeof buf, 0);
-        if (n > 0) {
-            // TCP 是字节流：读到的可能只是半截消息，回射服务器照单转发即可
-            LogLine(id_, peer_.c_str(), "recv  #%lu %zd bytes: \"%.*s\"",
-                    ++msgs_, n, (int)n, buf);
-            out_.append(buf, (size_t)n);
-            // 有待发数据了：向引擎叠加"可写"关注（旧版：FD_SET 到 ws 集合）
-            engine_.AddIoEvent(fd_, kReadEvent | kWriteEvent, this, NULL);
-            return;
-        }
-        if (n == 0) { Close("EOF by peer"); return; }
-        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
-            Close("recv error");          // 非阻塞下 EAGAIN 只是暂时没数据
-    }
+    void OnRead(FD, void*, std::int32_t) override {
+        char buffer[MAXLINE];
 
-    // 可写：把 out 缓冲尽力发完，发完了就撤销可写关注
-    void OnWrite(FD fd, void* data, int32_t mask) override {
-        (void)data; (void)mask;
-        while (!out_.empty()) {
-            ssize_t n = send(fd_, out_.data(), out_.size(), 0);
-            if (n > 0) {
-                LogLine(id_, peer_.c_str(), "send  %zd bytes (%zu bytes pending)",
-                        n, out_.size() - (size_t)n);
-                out_.erase(0, (size_t)n);
+        // 非阻塞 recv 要持续到 EAGAIN，取完本次已经到达的所有数据。
+        for (;;) {
+            const ssize_t received = recv(fd_, buffer, sizeof(buffer), 0);
+            if (received > 0) {
+                ++reads_;
+                out_.append(buffer, static_cast<size_t>(received));
+                LogLine(id_, peer_.c_str(), "recv #%lu %zd bytes: \"%.*s\"",
+                        reads_, received, static_cast<int>(received), buffer);
                 continue;
             }
+            if (received == 0) {
+                read_closed_ = true;
+                break;
+            }
             if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return;   // 缓冲满，下轮继续
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+
+            perror("recv");
+            Close("recv error");
+            return;
+        }
+
+        // 先增加写关注，再在半关闭时移除读关注，避免中间把 fd 完全移出引擎。
+        if (!out_.empty() &&
+            engine_.AddIoEvent(fd_, kWriteEvent, this, nullptr) != kOk) {
+            Close("add write event failed");
+            return;
+        }
+
+        if (read_closed_) {
+            engine_.DeleteIoEvent(fd_, kReadEvent);
+            // 对端关闭发送方向后，仍要把已经收到的数据完整回射。
+            if (out_.empty()) Close("EOF by peer");
+        }
+    }
+
+    void OnWrite(FD, void*, std::int32_t) override {
+        while (!out_.empty()) {
+            const ssize_t written =
+                send(fd_, out_.data(), out_.size(), MSG_NOSIGNAL);
+            if (written > 0) {
+                out_.erase(0, static_cast<size_t>(written));
+                LogLine(id_, peer_.c_str(), "send %zd bytes (%zu bytes pending)",
+                        written, out_.size());
+                continue;
+            }
+            if (written == -1 && errno == EINTR) continue;
+            if (written == -1 &&
+                (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                return;
+            }
+
+            if (written == -1) perror("send");
             Close("send error");
             return;
         }
-        // 发完了：撤销可写关注（旧版：下一轮不再 FD_SET 到 ws）。
-        // 不撤销的话内核缓冲只要有空位就会一直触发可写，空转烧 CPU
+
+        // LT 模式下空缓冲仍关注可写会导致事件循环持续空转。
         engine_.DeleteIoEvent(fd_, kWriteEvent);
+        if (read_closed_) Close("EOF by peer");
     }
 
 private:
@@ -88,79 +140,118 @@ private:
         LogLine(id_, peer_.c_str(), "closed (%s)", reason);
         engine_.DeleteIoEvent(fd_, kReadEvent | kWriteEvent);
         close(fd_);
-        delete this;    // 连接对象随连接一起销毁；引擎回调前会重查 entry，不会悬空
+
+        // 会话由自己管理生命周期。引擎在两个回调之间会重新查表，
+        // 因而删除注册项后不会再次调用这个对象。
+        delete this;
     }
 
-    SelectEngine& engine_;
-    FD            fd_;
-    long          id_;
-    std::string   peer_;
-    std::string   out_;      // 待发送缓冲：send 没发完的字节暂存（支持分段发送）
-    unsigned long msgs_ = 0; // 请求编号：区分同一连接的不同请求
+    IEventEngine& engine_;
+    FD fd_;
+    long id_;
+    std::string peer_;
+    std::string out_;
+    unsigned long reads_;
+    bool read_closed_;
 };
-
 
 class EchoServer : public IIoHandler {
 public:
-    EchoServer(SelectEngine& engine, FD listenfd)
-        : engine_(engine), listen_fd_(listenfd) {}
+    EchoServer(IEventEngine& engine, FD listenfd)
+        : engine_(engine), listenfd_(listenfd), next_id_(1) {}
 
-    void OnRead(FD fd, void* data, int32_t mask) override {
-        (void)fd; (void)data; (void)mask;
-        for (;;) {   // 非阻塞 accept 循环取空队列，取完返回 EAGAIN
-            sockaddr_in cliaddr{};
-            socklen_t clilen = sizeof cliaddr;
-            int cfd = accept(listen_fd_, (sockaddr*)&cliaddr, &clilen);
-            if (cfd < 0) break;
+    void OnRead(FD, void*, std::int32_t) override {
+        // 监听 socket 是非阻塞的，一次通知可能对应多个待接收连接。
+        for (;;) {
+            sockaddr_in client_address{};
+            socklen_t address_length = sizeof(client_address);
+            const int fd = accept(listenfd_,
+                                  reinterpret_cast<sockaddr*>(&client_address),
+                                  &address_length);
+            if (fd == -1) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+                perror("accept");
+                return;
+            }
 
-            set_nonblock(cfd);
+            if (!SetNonblocking(fd)) {
+                close(fd);
+                continue;
+            }
 
-            char ip[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &cliaddr.sin_addr, ip, sizeof ip);
-            char peer[64];
-            snprintf(peer, sizeof peer, "%s:%u", ip, (unsigned)ntohs(cliaddr.sin_port));
-
-            EchoSession* session = new EchoSession(engine_, cfd, next_id_++, peer);
-            engine_.AddIoEvent(cfd, kReadEvent, session, NULL);
+            EchoSession* const session =
+                new EchoSession(engine_, fd, next_id_++, PeerName(client_address));
+            if (engine_.AddIoEvent(fd, kReadEvent, session, nullptr) != kOk) {
+                fprintf(stderr, "无法把客户端 fd %d 注册到事件引擎\n", fd);
+                close(fd);
+                delete session;
+                continue;
+            }
+            session->LogConnected();
         }
     }
 
-    // 监听 socket 永远不会有可写事件，空实现即可
-    void OnWrite(FD, void*, int32_t) override {}
+    // 监听 socket 只注册读事件，不会调用这个空实现。
+    void OnWrite(FD, void*, std::int32_t) override {}
 
 private:
-    SelectEngine& engine_;
-    FD            listen_fd_;
-    long          next_id_ = 1;
+    IEventEngine& engine_;
+    FD listenfd_;
+    long next_id_;
 };
 
 int main() {
-    setvbuf(stdout, NULL, _IONBF, 0);
-    signal(SIGPIPE, SIG_IGN);   // 向已关闭的连接 send 默认会触发它杀死进程
+    setvbuf(stdout, nullptr, _IONBF, 0);
 
-    int listenfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listenfd < 0) { perror("socket"); return EXIT_FAILURE; }
+    // 1. 创建并配置非阻塞 IPv4 TCP 监听 socket。
+    const int listenfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listenfd == -1) {
+        perror("socket");
+        return EXIT_FAILURE;
+    }
 
-    int on = 1;
-    setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+    const int reuse = 1;
+    if (setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &reuse,
+                   sizeof(reuse)) == -1) {
+        perror("setsockopt");
+        close(listenfd);
+        return EXIT_FAILURE;
+    }
 
-    sockaddr_in servaddr{};
-    servaddr.sin_family      = AF_INET;
-    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
-    servaddr.sin_port        = htons(SERV_PORT);
-    if (bind(listenfd, (sockaddr*)&servaddr, sizeof servaddr) < 0) { perror("bind"); return EXIT_FAILURE; }
-    if (listen(listenfd, LISTENQ) < 0) { perror("listen"); return EXIT_FAILURE; }
-    set_nonblock(listenfd);
+    sockaddr_in server_address{};
+    server_address.sin_family = AF_INET;
+    server_address.sin_addr.s_addr = htonl(INADDR_ANY);
+    server_address.sin_port = htons(SERV_PORT);
+    if (bind(listenfd, reinterpret_cast<const sockaddr*>(&server_address),
+             sizeof(server_address)) == -1) {
+        perror("bind");
+        close(listenfd);
+        return EXIT_FAILURE;
+    }
+    if (listen(listenfd, LISTENQ) == -1) {
+        perror("listen");
+        close(listenfd);
+        return EXIT_FAILURE;
+    }
+    if (!SetNonblocking(listenfd)) {
+        close(listenfd);
+        return EXIT_FAILURE;
+    }
 
-    // ---- 业务方代码到此为止只有这些：注册监听 fd，然后跑引擎 ----
+    // 2. 业务层只负责注册监听 fd；等待和分发都由事件引擎完成。
     SelectEngine engine;
-    EchoServer   acceptor(engine, listenfd);
-    engine.AddIoEvent(listenfd, kReadEvent, &acceptor, NULL);
+    EchoServer server(engine, listenfd);
+    if (engine.AddIoEvent(listenfd, kReadEvent, &server, nullptr) != kOk) {
+        fprintf(stderr, "无法把监听 fd 注册到 select 引擎\n");
+        close(listenfd);
+        return EXIT_FAILURE;
+    }
 
-    char ts[32];
-    time_t now = time(NULL);
-    strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", localtime(&now));
-    printf("[%s] [server] [-] listening on 0.0.0.0:%d (select engine)\n", ts, SERV_PORT);
+    LogLine(0, nullptr, "listening on 0.0.0.0:%d (select engine)", SERV_PORT);
+    const ErrCode result = engine.Run();
 
-    return engine.Run();   // 一切事件都在引擎循环里分发，业务代码再无 while/select
+    engine.DeleteIoEvent(listenfd, kReadEvent);
+    close(listenfd);
+    return result == kOk ? EXIT_SUCCESS : EXIT_FAILURE;
 }
